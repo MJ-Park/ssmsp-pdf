@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     # === Vertex AI 설정 ===
     EMBEDDING_MODEL: str = "text-embedding-004"
     EMBEDDING_DIMENSION: int = 768
-    LLM_MODEL: str = "gemini-2.5-flash-lite"
+    LLM_MODEL: str = "gemini-2.5-flash"
 
     # === 벡터 검색 설정 ===
     ENDPOINT_RESOURCE_NAME: str = "projects/95390507074/locations/asia-northeast3/indexEndpoints/7307495015687651328"
