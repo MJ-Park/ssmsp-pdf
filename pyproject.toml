@@ -9,4 +9,5 @@ dependencies = [
     "pdfplumber",
     "pandas",
     "openpyxl",
+    "playwright>=1.58.0",
 ]
