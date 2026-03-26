@@ -65,6 +65,21 @@ uv run streamlit run app.py
   - 리뷰 액션을 저장한 뒤 메인 화면의 검증 결과 섹션에서 다운로드할 수 있습니다.
   - 파일은 브라우저 다운로드 위치에 저장되며, `review_scope`, `row_id`, `source_file`, `page`, `reviewer_action`, `reviewer_note`, `reviewed_at` 등을 포함합니다.
 
+## AI Suggestions
+
+- `reference 문서`와 `test 문서`
+  - 데모에서는 `input/` 폴더의 문서를 기준으로 reference와 test를 나눠 비교합니다.
+  - 기본값은 `2024년 2권역 + 2025년 1권역 = reference`, `2025년 2권역 = test` 입니다.
+- `AI 제안의 의미`
+  - AI가 만드는 결과는 “확정 판단”이 아니라 “추가 검토 후보”입니다.
+  - 이미 현재 문서에 충분히 반영된 내용은 제외하고, reference 사례가 있는 항목만 제안하도록 설계합니다.
+- `근거 reference row 확인`
+  - 각 제안에 표시되는 reference `row_id / source_file / page`를 통해 근거를 확인할 수 있습니다.
+  - `검토 열기` 버튼을 누르면 기존 빠른 검토 모달에서 해당 row를 다시 볼 수 있습니다.
+- `비교 방식`
+  - 벡터DB 없이 category 비교와 대표 reference 사례 선정을 기반으로 데모가 동작합니다.
+  - category 분포 차이와 representative row를 LLM에 넣어 추가 위험성 후보를 생성합니다.
+
 ## Sample Test
 
 의존성 설치 후 원하는 PDF 파일 경로를 넘겨 간단히 확인할 수 있습니다.

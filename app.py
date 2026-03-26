@@ -8,10 +8,22 @@ import json
 import re
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import pdfplumber
 import streamlit as st
+from ai_suggestions import (
+    AISuggestionConfigError,
+    AISuggestionLLMError,
+    DEFAULT_REFERENCE_FILES,
+    DEFAULT_TEST_FILE,
+    build_comparison_artifacts,
+    comparison_to_summary_rows,
+    generate_ai_suggestions,
+    suggestions_to_csv_rows,
+)
+from settings import settings
 from validation import ISSUE_REASONS, validate_extraction_rows
 
 # --- [Core Logic] 파싱 설정 ---
@@ -1017,6 +1029,54 @@ def build_document_summary_map(document_summary_rows):
     return {summary["document_id"]: summary for summary in document_summary_rows}
 
 
+@st.cache_data(show_spinner=False)
+def load_demo_input_documents():
+    input_dir = Path(__file__).resolve().parent / "input"
+    if not input_dir.exists():
+        return {
+            "available_files": [],
+            "all_rows": [],
+            "rows_by_source": {},
+            "row_lookup": {},
+            "document_payloads": {},
+            "errors": [f"input 폴더를 찾을 수 없습니다: {input_dir}"],
+        }
+
+    available_files = sorted([path.name for path in input_dir.glob("*.pdf")])
+    all_rows = []
+    document_payloads = {}
+    errors = []
+
+    for file_name in available_files:
+        pdf_path = input_dir / file_name
+        try:
+            file_bytes = pdf_path.read_bytes()
+            document_id = build_document_id(file_name, file_bytes)
+            raw_rows = parse_pdf_bytes(file_bytes, TYPE_2024, file_name)
+            all_rows.extend(raw_rows)
+            document_payloads[document_id] = {"source_file": file_name, "file_bytes": file_bytes}
+        except Exception as exc:
+            errors.append(f"{file_name}: {exc}")
+
+    validation_state = validate_extraction_rows(all_rows)
+    validated_rows = validation_state["validated_rows"]
+    rows_by_source = defaultdict(list)
+    row_lookup = {}
+    for row in validated_rows:
+        rows_by_source[row.get("source_file", "")].append(row)
+        row_lookup[row.get("row_id", "")] = row
+
+    return {
+        "available_files": available_files,
+        "all_rows": validated_rows,
+        "rows_by_source": dict(rows_by_source),
+        "row_lookup": row_lookup,
+        "document_payloads": document_payloads,
+        "validation": validation_state,
+        "errors": errors,
+    }
+
+
 def build_review_rows(rows):
     review_rows = [row for row in rows if row.get("validation_status") != "normal"]
     return sorted(
@@ -1031,8 +1091,22 @@ def build_review_rows(rows):
 
 
 def build_review_index(rows):
+    return build_row_index(rows, suspicious_only=True)
+
+
+def build_row_index(rows, suspicious_only=True):
     review_index = {}
-    for row in build_review_rows(rows):
+    source_rows = build_review_rows(rows) if suspicious_only else sorted(
+        rows,
+        key=lambda row: (
+            clean_text(row.get("source_file")),
+            safe_positive_int(row.get("page"), default=999999),
+            safe_positive_int(row.get("row_index"), default=999999),
+            clean_text(row.get("row_id")),
+        ),
+    )
+
+    for row in source_rows:
         source_file = clean_text(row.get("source_file"))
         page = safe_positive_int(row.get("page"))
         if not source_file or not page:
@@ -1108,6 +1182,22 @@ def build_review_progress(rows):
         "reviewed": reviewed_count,
         "unresolved": unresolved_count,
     }
+
+
+def open_review_modal_for_external_row(target_row_id, rows, document_payloads):
+    target_row = next((row for row in rows if clean_text(row.get("row_id")) == clean_text(target_row_id)), None)
+    if not target_row:
+        return
+
+    st.session_state["review_modal_context"] = {
+        "rows": rows,
+        "document_payloads": document_payloads,
+        "read_only": True,
+    }
+    queue_selected_review_row(target_row)
+    st.session_state["review_modal_open"] = True
+    st.session_state["review_pending_issue_row_id"] = ""
+    st.rerun()
 
 
 def format_issue_codes(issue_codes):
@@ -1627,15 +1717,18 @@ def initialize_review_selection(review_index):
 def render_quick_review_dialog(result_state):
     apply_pending_review_selection()
 
-    all_results = result_state.get("all_results", [])
-    document_payloads = result_state.get("document_payloads", {})
-    review_index = build_review_index(all_results)
-    page_summary_map = build_page_summary_map(result_state.get("validation", {}).get("page_summary_rows", []))
+    modal_context = st.session_state.get("review_modal_context")
+    read_only_mode = bool(modal_context and modal_context.get("read_only"))
+    all_results = modal_context.get("rows", []) if modal_context else result_state.get("all_results", [])
+    document_payloads = modal_context.get("document_payloads", {}) if modal_context else result_state.get("document_payloads", {})
+    review_index = build_row_index(all_results, suspicious_only=not read_only_mode)
+    page_summary_map = build_page_summary_map(result_state.get("validation", {}).get("page_summary_rows", [])) if not read_only_mode else {}
 
     if not review_index:
         st.info("검토할 의심 행이 없습니다.")
         if st.button("검토 닫기", use_container_width=True):
             st.session_state["review_modal_open"] = False
+            st.session_state["review_modal_context"] = None
             st.rerun()
         return
 
@@ -1644,6 +1737,7 @@ def render_quick_review_dialog(result_state):
         st.info("검토 가능한 행이 없습니다.")
         if st.button("검토 닫기", use_container_width=True):
             st.session_state["review_modal_open"] = False
+            st.session_state["review_modal_context"] = None
             st.rerun()
         return
 
@@ -1685,21 +1779,24 @@ def render_quick_review_dialog(result_state):
     if top_col4.button("닫기", use_container_width=True):
         st.session_state["review_modal_open"] = False
         st.session_state["review_pending_issue_row_id"] = ""
+        st.session_state["review_modal_context"] = None
         st.rerun()
 
     selected_row = row_map[selected_row_id]
     page_rows = review_index[selected_source_file]["pages"][selected_page]
     page_summary = page_summary_map.get((selected_row.get("document_id"), selected_source_file, selected_page), {})
-    progress = build_review_progress(all_results)
+    progress = build_review_progress(all_results) if not read_only_mode else None
 
-    if progress["unresolved"] > 0:
+    if not read_only_mode and progress and progress["unresolved"] > 0:
         st.session_state["review_queue_completed"] = False
         st.caption(
             f"남은 의심 행 {progress['unresolved']}건 / 전체 {progress['total']}건 | "
             f"현재 페이지 의심 행 {len(page_rows)}건"
         )
-    elif st.session_state.get("review_queue_completed"):
+    elif not read_only_mode and st.session_state.get("review_queue_completed"):
         st.success("모든 의심 행 검토를 완료했습니다.")
+    elif read_only_mode:
+        st.caption("AI 제안의 근거 row를 확인하는 읽기 전용 모드입니다.")
 
     render_review_header(selected_row, page_summary)
 
@@ -1721,53 +1818,259 @@ def render_quick_review_dialog(result_state):
         st.write("")
         render_modal_issue_summary(selected_row)
 
-    pending_issue_row_id = st.session_state.get("review_pending_issue_row_id", "")
-    note_key = f"review_issue_note_{selected_row.get('row_id', '')}"
-    existing_decision = get_review_decision(
-        "row",
-        selected_row.get("document_id", ""),
-        selected_row.get("page", ""),
-        row_id=selected_row.get("row_id", ""),
-    )
+    if not read_only_mode:
+        pending_issue_row_id = st.session_state.get("review_pending_issue_row_id", "")
+        note_key = f"review_issue_note_{selected_row.get('row_id', '')}"
+        existing_decision = get_review_decision(
+            "row",
+            selected_row.get("document_id", ""),
+            selected_row.get("page", ""),
+            row_id=selected_row.get("row_id", ""),
+        )
 
-    if pending_issue_row_id == selected_row.get("row_id"):
-        if note_key not in st.session_state:
-            st.session_state[note_key] = existing_decision.get("reviewer_note", "")
+        if pending_issue_row_id == selected_row.get("row_id"):
+            if note_key not in st.session_state:
+                st.session_state[note_key] = existing_decision.get("reviewer_note", "")
+
+            st.write("")
+            with st.container(border=True):
+                st.markdown("**문제 메모**")
+                st.text_area(
+                    "문제 메모",
+                    key=note_key,
+                    height=90,
+                    placeholder="문제가 있다고 판단한 이유를 짧게 적어주세요.",
+                    label_visibility="collapsed",
+                )
+                confirm_col, cancel_col = st.columns(2)
+                if confirm_col.button("문제 있음 저장 후 다음", use_container_width=True, type="primary"):
+                    reviewer_note = clean_text(st.session_state.get(note_key, ""))
+                    if not reviewer_note:
+                        st.warning("문제 메모를 입력해 주세요.")
+                    else:
+                        save_and_advance_review(all_results, selected_row, "문제 있음", reviewer_note)
+                        st.rerun()
+                if cancel_col.button("취소", use_container_width=True):
+                    st.session_state["review_pending_issue_row_id"] = ""
+                    st.rerun()
 
         st.write("")
+        action_col1, action_col2 = st.columns(2, gap="large")
+        if action_col1.button("문제 없음", use_container_width=True, type="primary"):
+            st.session_state[note_key] = ""
+            save_and_advance_review(all_results, selected_row, "문제 없음", "")
+            st.rerun()
+
+        if action_col2.button("문제 있음", use_container_width=True):
+            if note_key not in st.session_state:
+                st.session_state[note_key] = existing_decision.get("reviewer_note", "")
+            st.session_state["review_pending_issue_row_id"] = selected_row.get("row_id", "")
+            st.rerun()
+
+def render_ai_suggestion_section():
+    st.divider()
+    st.subheader("🤖 AI 추가 검토 제안")
+    st.caption("reference 문서와 test 문서를 category 기준으로 비교한 뒤, Gemini가 추가 검토 후보를 제안합니다.")
+
+    demo_data = load_demo_input_documents()
+    if demo_data["errors"]:
+        for error_message in demo_data["errors"]:
+            st.error(error_message)
+        return
+
+    available_files = demo_data["available_files"]
+    if not available_files:
+        st.info("input 폴더에서 데모용 PDF를 찾지 못했습니다.")
+        return
+
+    default_reference_files = [file_name for file_name in DEFAULT_REFERENCE_FILES if file_name in available_files]
+    default_test_file = DEFAULT_TEST_FILE if DEFAULT_TEST_FILE in available_files else available_files[0]
+
+    control_col1, control_col2, control_col3 = st.columns([1.4, 1.0, 0.6], gap="large")
+    reference_files = control_col1.multiselect(
+        "reference 문서",
+        options=available_files,
+        default=default_reference_files,
+        key="ai_reference_files",
+    )
+    test_file = control_col2.selectbox(
+        "test 문서",
+        options=available_files,
+        index=available_files.index(default_test_file),
+        key="ai_test_file",
+    )
+
+    if test_file in reference_files:
+        st.warning("test 문서는 reference 문서 목록과 겹치지 않게 선택해 주세요.")
+        return
+
+    comparison = build_comparison_artifacts(demo_data["all_rows"], reference_files, test_file)
+    reference_count_df = pd.DataFrame(
+        [{"category": category, "count": count} for category, count in sorted(comparison.reference_counts.items())]
+    )
+    test_count_df = pd.DataFrame(
+        [{"category": category, "count": count} for category, count in sorted(comparison.test_counts.items())]
+    )
+    comparison_df = pd.DataFrame(comparison_to_summary_rows(comparison))
+
+    control_col3.write("")
+    control_col3.write("")
+    if control_col3.button("AI 추가 제안 생성", use_container_width=True, type="primary"):
+        try:
+            with st.spinner("reference/test 문서를 비교하고 AI 제안을 생성하는 중입니다..."):
+                ai_state = generate_ai_suggestions(demo_data["all_rows"], reference_files, test_file)
+            st.session_state["ai_suggestions_state"] = {
+                "reference_files": reference_files,
+                "test_file": test_file,
+                "suggestions": ai_state["suggestions"],
+                "comparison": {
+                    "reference_counts": comparison.reference_counts,
+                    "test_counts": comparison.test_counts,
+                    "missing_categories": comparison.missing_categories,
+                    "weak_categories": comparison.weak_categories,
+                    "summary_rows": comparison_to_summary_rows(comparison),
+                },
+                "raw_response_text": ai_state["raw_response_text"],
+                "model_name": ai_state["model_name"],
+            }
+            st.session_state["ai_suggestions_error"] = ""
+        except (AISuggestionConfigError, AISuggestionLLMError, ValueError) as exc:
+            st.session_state["ai_suggestions_error"] = str(exc)
+            st.session_state["ai_suggestions_state"] = None
+
+    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+    metric_col1.metric("reference 문서 수", len(reference_files))
+    metric_col2.metric("reference row 수", len(comparison.reference_rows))
+    metric_col3.metric("test row 수", len(comparison.test_rows))
+    metric_col4.metric("부족 카테고리 수", len(comparison.missing_categories) + len(comparison.weak_categories))
+
+    summary_col1, summary_col2 = st.columns(2, gap="large")
+    with summary_col1:
+        st.markdown("**Reference 카테고리 분포**")
+        if reference_count_df.empty:
+            st.caption("reference 카테고리 데이터가 없습니다.")
+        else:
+            st.dataframe(reference_count_df, use_container_width=True, hide_index=True)
+    with summary_col2:
+        st.markdown("**Test 카테고리 분포**")
+        if test_count_df.empty:
+            st.caption("test 카테고리 데이터가 없습니다.")
+        else:
+            st.dataframe(test_count_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**부족/누락 카테고리 비교**")
+    if comparison_df.empty:
+        st.caption("category 비교 결과가 없습니다.")
+    else:
+        st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+
+    comparison_summary_json = json.dumps(
+        {
+            "reference_files": reference_files,
+            "test_file": test_file,
+            "reference_counts": comparison.reference_counts,
+            "test_counts": comparison.test_counts,
+            "missing_categories": comparison.missing_categories,
+            "weak_categories": comparison.weak_categories,
+            "summary_rows": comparison_to_summary_rows(comparison),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    comparison_download_col1, comparison_download_col2 = st.columns(2)
+    comparison_download_col1.download_button(
+        label="📥 category_comparison_summary.json 다운로드",
+        data=comparison_summary_json,
+        file_name="category_comparison_summary.json",
+        mime="application/json",
+    )
+    comparison_download_col2.download_button(
+        label="📥 category_comparison_summary.csv 다운로드",
+        data=pd.DataFrame(comparison_to_summary_rows(comparison)).to_csv(index=False, encoding="utf-8-sig"),
+        file_name="category_comparison_summary.csv",
+        mime="text/csv",
+    )
+
+    ai_error_message = st.session_state.get("ai_suggestions_error", "")
+    ai_state = st.session_state.get("ai_suggestions_state")
+    if ai_error_message:
+        st.error(ai_error_message)
+
+    if not ai_state:
+        return
+
+    if ai_state.get("reference_files") != reference_files or ai_state.get("test_file") != test_file:
+        st.info("현재 선택과 다른 조합으로 생성된 AI 제안이 있습니다. 다시 생성하면 최신 조합으로 갱신됩니다.")
+        return
+
+    st.markdown("**AI 추가 검토 제안**")
+    suggestions = ai_state.get("suggestions", [])
+    if not suggestions:
+        st.info("현재 비교 결과 기준으로 추가 제안이 생성되지 않았습니다.")
+        return
+
+    suggestions_json = json.dumps(suggestions, ensure_ascii=False, indent=2)
+    suggestions_csv = pd.DataFrame(suggestions_to_csv_rows(suggestions)).to_csv(index=False, encoding="utf-8-sig")
+    suggestion_download_col1, suggestion_download_col2 = st.columns(2)
+    suggestion_download_col1.download_button(
+        label="📥 ai_suggestions.json 다운로드",
+        data=suggestions_json,
+        file_name="ai_suggestions.json",
+        mime="application/json",
+    )
+    suggestion_download_col2.download_button(
+        label="📥 ai_suggestions.csv 다운로드",
+        data=suggestions_csv,
+        file_name="ai_suggestions.csv",
+        mime="text/csv",
+    )
+
+    row_lookup = demo_data["row_lookup"]
+    for index, suggestion in enumerate(suggestions, start=1):
         with st.container(border=True):
-            st.markdown("**문제 메모**")
-            st.text_area(
-                "문제 메모",
-                key=note_key,
-                height=90,
-                placeholder="문제가 있다고 판단한 이유를 짧게 적어주세요.",
-                label_visibility="collapsed",
-            )
-            confirm_col, cancel_col = st.columns(2)
-            if confirm_col.button("문제 있음 저장 후 다음", use_container_width=True, type="primary"):
-                reviewer_note = clean_text(st.session_state.get(note_key, ""))
-                if not reviewer_note:
-                    st.warning("문제 메모를 입력해 주세요.")
-                else:
-                    save_and_advance_review(all_results, selected_row, "문제 있음", reviewer_note)
-                    st.rerun()
-            if cancel_col.button("취소", use_container_width=True):
-                st.session_state["review_pending_issue_row_id"] = ""
-                st.rerun()
+            st.markdown(f"**{index}. [{suggestion.get('category', '-')}] {suggestion.get('suggestion_title', '-') }**")
+            st.write(suggestion.get("why_review_needed", ""))
 
-    st.write("")
-    action_col1, action_col2 = st.columns(2, gap="large")
-    if action_col1.button("문제 없음", use_container_width=True, type="primary"):
-        st.session_state[note_key] = ""
-        save_and_advance_review(all_results, selected_row, "문제 없음", "")
-        st.rerun()
+            meta_col1, meta_col2 = st.columns(2)
+            meta_col1.write(f"confidence: `{suggestion.get('confidence', 0)}`")
+            meta_col2.write(f"human_review_required: `{suggestion.get('human_review_required', True)}`")
 
-    if action_col2.button("문제 있음", use_container_width=True):
-        if note_key not in st.session_state:
-            st.session_state[note_key] = existing_decision.get("reviewer_note", "")
-        st.session_state["review_pending_issue_row_id"] = selected_row.get("row_id", "")
-        st.rerun()
+            st.markdown("**Suggested Risk Description**")
+            st.write(suggestion.get("suggested_risk_description", ""))
+
+            st.markdown("**Suggested Controls**")
+            suggested_controls = suggestion.get("suggested_controls", [])
+            if suggested_controls:
+                for control in suggested_controls:
+                    st.write(f"- {control}")
+            else:
+                st.caption("제안된 control이 없습니다.")
+
+            st.markdown("**근거 Reference Rows**")
+            if suggestion.get("evidence_reference_rows"):
+                for row_id in suggestion["evidence_reference_rows"]:
+                    row = row_lookup.get(row_id)
+                    if row:
+                        label = f"{row_id} | {row.get('source_file')} | p{row.get('page')}"
+                        info_col, action_col = st.columns([0.8, 0.2])
+                        info_col.write(label)
+                        if action_col.button("검토 열기", key=f"open_ref_{index}_{row_id}", use_container_width=True):
+                            open_review_modal_for_external_row(row_id, demo_data["all_rows"], demo_data["document_payloads"])
+                    else:
+                        st.write(row_id)
+            else:
+                st.caption("근거 reference row가 없습니다.")
+
+            st.markdown("**Related Test Rows**")
+            if suggestion.get("related_test_rows"):
+                for row_id in suggestion["related_test_rows"]:
+                    row = row_lookup.get(row_id)
+                    if row:
+                        st.write(f"{row_id} | {row.get('source_file')} | p{row.get('page')}")
+                    else:
+                        st.write(row_id)
+            else:
+                st.caption("관련 test row가 없습니다.")
 
 
 def render_conversion_results(result_state):
@@ -1858,6 +2161,7 @@ def render_conversion_results(result_state):
                 review_button_col, review_info_col = st.columns([0.3, 0.7])
                 if review_button_col.button("🔎 검토하기", use_container_width=True):
                     initialize_review_selection(build_review_index(all_results))
+                    st.session_state["review_modal_context"] = None
                     st.session_state["review_modal_open"] = True
                     st.session_state["review_pending_issue_row_id"] = ""
                     st.session_state["review_queue_completed"] = False
@@ -1923,6 +2227,8 @@ def render_conversion_results(result_state):
                     file_name="review_decisions.csv",
                     mime="text/csv",
                 )
+
+            render_ai_suggestion_section()
     else:
         st.warning("추출된 데이터가 없습니다. extraction_report.csv의 warnings를 확인해 주세요.")
 
@@ -1940,6 +2246,12 @@ if "review_queue_completed" not in st.session_state:
     st.session_state["review_queue_completed"] = False
 if "review_selection_target" not in st.session_state:
     st.session_state["review_selection_target"] = None
+if "review_modal_context" not in st.session_state:
+    st.session_state["review_modal_context"] = None
+if "ai_suggestions_state" not in st.session_state:
+    st.session_state["ai_suggestions_state"] = None
+if "ai_suggestions_error" not in st.session_state:
+    st.session_state["ai_suggestions_error"] = ""
 initialize_review_mode()
 initialize_review_decisions()
 
@@ -2040,6 +2352,9 @@ if uploaded_files:
         st.session_state["review_pending_issue_row_id"] = ""
         st.session_state["review_queue_completed"] = False
         st.session_state["review_selection_target"] = None
+        st.session_state["review_modal_context"] = None
+        st.session_state["ai_suggestions_state"] = None
+        st.session_state["ai_suggestions_error"] = ""
 
         review_rows = build_review_rows(validated_rows)
         if review_rows:

@@ -8,3 +8,4 @@ __pycache__/
 .playwright-artifacts/
 .playwright-debs/
 .playwright-libs/
+.env
