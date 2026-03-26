@@ -1,0 +1,12 @@
+[project]
+name = "ssmsp-pdf"
+version = "0.1.0"
+description = "PDF 위험성평가표를 CSV와 JSONL로 변환하는 Streamlit 앱"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "streamlit",
+    "pdfplumber",
+    "pandas",
+    "openpyxl",
+]
