@@ -16,13 +16,13 @@ class Settings(BaseSettings):
 
     # === Google Cloud 설정 ===
     GCP_PROJECT_ID: str = "cokiri-ssmsp"
-    GCP_LOCATION: str = "asia-northeast3"
+    GCP_LOCATION: str = "global"
     GOOGLE_APPLICATION_CREDENTIALS: Optional[str] = None
 
     # === Vertex AI 설정 ===
     EMBEDDING_MODEL: str = "text-embedding-004"
     EMBEDDING_DIMENSION: int = 768
-    LLM_MODEL: str = "gemini-2.5-flash"
+    LLM_MODEL: str = "gemini-3.1-flash-lite-preview"
 
     # === 벡터 검색 설정 ===
     ENDPOINT_RESOURCE_NAME: str = "projects/95390507074/locations/asia-northeast3/indexEndpoints/7307495015687651328"
